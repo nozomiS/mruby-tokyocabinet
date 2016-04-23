@@ -160,20 +160,39 @@ static mrb_value
 hdb_out(mrb_state *mrb, mrb_value self)
 {
   hdb_context *context = DATA_PTR(self);
-  bool result;
-  mrb_value key;
+  mrb_value key, block, result;
   void *kbuf;
   int ksize;
   mrb_int kint;
+  int sp = 0;
+  void *value;
 
-  mrb_get_args(mrb, "o", &key);
+  mrb_get_args(mrb, "o|&", &key, &block);
 
   if (!get_content(key, &kint, &kbuf, &ksize)) {
     mrb_raise(mrb, E_ARGUMENT_ERROR, "invalid type of key");
   }
-  result = tchdbout(context->hdb, kbuf, ksize);
 
-  return mrb_bool_value(result);
+  value = tchdbget(context->hdb, kbuf, ksize, &sp);
+  if (value == NULL || sp <= 0) {
+    if (value) {
+      free(value);
+    }
+    return mrb_nil_value();
+  }
+
+  // backup
+  result = mrb_str_new(mrb, value, sp);
+
+  if (tchdbout(context->hdb, kbuf, ksize)) {
+    if (!mrb_nil_p(block)) {
+     // mrb_protect(mrb, result);
+      mrb_yield(mrb, block, result);
+    }
+    return result;
+  } else {
+    return mrb_nil_value();
+  }
 }
 
 static mrb_value
@@ -367,9 +386,81 @@ hdb_check_key(mrb_state *mrb, mrb_value self)
   return mrb_bool_value(tchdbvsiz(context->hdb, kbuf, ksize) >= 0);
 }
 
+enum {
+  EACH_KEY = 1,
+  EACH_VALUE = 2,
+  EACH_BOTH = 3,
+};
 
+/// this function is inspired by gem version of each
+static mrb_value
+hdb_each_common(mrb_state *mrb, mrb_value self, int mode)
+{
+  hdb_context *context = DATA_PTR(self);
+  mrb_value block;
+  TCXSTR *kxstr, *vxstr;
 
+  mrb_get_args(mrb, "&", &block);
+  if (mrb_nil_p(block)) {
+    mrb_raise(mrb, E_ARGUMENT_ERROR, "block must be specified");
+  }
 
+  kxstr = tcxstrnew();
+  vxstr = tcxstrnew();
+
+  tchdbiterinit(context->hdb);
+
+  while (tchdbiternext3(context->hdb, kxstr, vxstr)) {
+    mrb_int argc;
+    mrb_value argv[2];
+    switch (mode) {
+    case EACH_KEY:
+	argc = 1;
+	argv[0] = mrb_str_new(mrb, tcxstrptr(kxstr), tcxstrsize(kxstr));
+	break;
+    case EACH_VALUE:
+	argc = 1;
+	argv[0] = mrb_str_new(mrb, tcxstrptr(vxstr), tcxstrsize(vxstr));
+	break;
+    case EACH_BOTH:
+	argc = 2;
+	argv[0] = mrb_str_new(mrb, tcxstrptr(kxstr), tcxstrsize(kxstr));
+	argv[1] = mrb_str_new(mrb, tcxstrptr(vxstr), tcxstrsize(vxstr));
+	break;
+    default:
+	// should i write in case of this? no, I don't think so.
+	// 'cause this function is file scope function and I can control everything.
+	break;
+    }
+    mrb_yield_argv(mrb, block, argc, &argv[0]); 
+  }
+
+  // XXX if an exception is caused between new and del, these two values
+  // could cause memory leak? I'm not sure because Im' not an expert for
+  // mruby but I believe so. SHOULD fix this.
+  tcxstrdel(vxstr);
+  tcxstrdel(kxstr);
+
+  return self; 
+}
+
+static mrb_value
+hdb_each(mrb_state *mrb, mrb_value self)
+{
+  return hdb_each_common(mrb, self, EACH_BOTH);
+}
+
+static mrb_value
+hdb_each_key(mrb_state *mrb, mrb_value self)
+{
+  return hdb_each_common(mrb, self, EACH_KEY);
+}
+
+static mrb_value
+hdb_each_value(mrb_state *mrb, mrb_value self)
+{
+  return hdb_each_common(mrb, self, EACH_VALUE);
+}
 
 
 
@@ -404,12 +495,17 @@ mrb_mruby_tokyocabinet_gem_init(mrb_state* mrb) {
   mrb_define_method(mrb, c, "[]=", hdb_put, MRB_ARGS_REQ(2));
   mrb_define_method(mrb, c, "store", hdb_put, MRB_ARGS_REQ(2));
   mrb_define_method(mrb, c, "assoc", hdb_assoc, MRB_ARGS_REQ(2));
-  mrb_define_method(mrb, c, "delete", hdb_out, MRB_ARGS_REQ(1));
+  mrb_define_method(mrb, c, "delete", hdb_out, MRB_ARGS_REQ(1)|MRB_ARGS_OPT(1));
 
   mrb_define_method(mrb, c, "empty?", hdb_empty_, MRB_ARGS_NONE());
   mrb_define_method(mrb, c, "has_key?", hdb_check_key, MRB_ARGS_REQ(1));
   mrb_define_method(mrb, c, "include?", hdb_check_key, MRB_ARGS_REQ(1));
   mrb_define_method(mrb, c, "member?", hdb_check_key, MRB_ARGS_REQ(1));
+
+  mrb_define_method(mrb, c, "each", hdb_each, MRB_ARGS_REQ(1));
+  mrb_define_method(mrb, c, "each_pair", hdb_each, MRB_ARGS_REQ(1));
+  mrb_define_method(mrb, c, "each_key", hdb_each_key, MRB_ARGS_REQ(1));
+  mrb_define_method(mrb, c, "each_value", hdb_each_value, MRB_ARGS_REQ(1));
 
   mrb_define_method(mrb, c, "length", hdb_record_num, MRB_ARGS_NONE());
   mrb_define_method(mrb, c, "size", hdb_record_num, MRB_ARGS_NONE());
